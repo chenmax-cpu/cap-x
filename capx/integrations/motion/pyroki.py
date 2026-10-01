@@ -47,6 +47,35 @@ def init_pyroki(
 
     return ik_solve_fn
 
+
+def init_pyroki_ik_check(
+    server_url: str = DEFAULT_URL,
+) -> Callable[..., tuple[np.ndarray, np.ndarray | None]]:
+    """IK client that also returns the pose the solver actually reached.
+
+    PyRoKi's IK is a least-squares solve and always returns *some* configuration; the achieved
+    pose (forward kinematics of the target link at that configuration, served by the PyRoKi
+    server when ``return_pose`` is requested) is what tells whether the target was reachable.
+    Returns ``(joint_positions, achieved_pose_wxyz_xyz)``; the pose is ``None`` when the server
+    predates the ``return_pose`` field.
+    """
+    server_url = server_url.rstrip("/")
+
+    def ik_check_fn(
+        target_pose_wxyz_xyz: np.ndarray, prev_cfg: np.ndarray | None = None
+    ) -> tuple[np.ndarray, np.ndarray | None]:
+        payload = {
+            "target_pose_wxyz_xyz": np.asarray(target_pose_wxyz_xyz, dtype=np.float64).tolist(),
+            "prev_cfg": np.asarray(prev_cfg, dtype=np.float64).tolist() if prev_cfg is not None else None,
+            "return_pose": True,
+        }
+        data = post_with_retries(f"{server_url}/ik", payload, timeout_seconds=15.0)
+        joints = np.asarray(data["joint_positions"], dtype=np.float64)
+        achieved = data.get("achieved_pose_wxyz_xyz")
+        return joints, (np.asarray(achieved, dtype=np.float64) if achieved is not None else None)
+
+    return ik_check_fn
+
     # =====================================================
     # PLANNING WRAPPER
     # =====================================================

@@ -26,8 +26,14 @@ from capx.integrations.franka.common import (
     transform_pose_arm0_to_arm1,
 )
 from capx.integrations.vision.graspnet import init_contact_graspnet
-from capx.integrations.vision.molmo import init_molmo
-from capx.integrations.motion.pyroki import init_pyroki, init_pyroki_trajopt
+from capx.integrations.vision.molmo import init_molmo, molmo_service_available
+from capx.integrations.motion.pyroki import init_pyroki, init_pyroki_ik_check, init_pyroki_trajopt
+from capx.integrations.franka.geometric_grasp import (
+    InsufficientGeometryError,
+    geometric_grasp_candidates,
+    object_points_from_mask,
+    scene_points_from_depth,
+)
 
 from capx.integrations.vision.owlvit import init_owlvit
 from capx.integrations.motion.pyroki_context import get_pyroki_context  # type: ignore
@@ -41,6 +47,22 @@ from capx.utils.visualization_utils import (
     overlay_segmentation_masks,
     render_cylinder_axis,
 )
+
+
+class NoGraspCandidatesError(RuntimeError):
+    """``plan_grasp`` found no grasp for the segmented object.
+
+    Raised when Contact-GraspNet returns no candidates *and* the geometric fallback cannot
+    produce a collision-free, reachable pinch grasp from the segment's 3D points. The message
+    starts with ``no_grasp_candidates:`` and states the mask size, depth range, planner depth
+    window and why the fallback gave up; ``details`` holds the same as a dict.
+    """
+
+    code = "no_grasp_candidates"
+
+    def __init__(self, message: str, details: dict[str, Any] | None = None) -> None:
+        super().__init__(f"{self.code}: {message}")
+        self.details = details or {}
 
 
 # ------------------------------- Control API ------------------------------
@@ -78,21 +100,30 @@ class FrankaControlApiReduced(ApiBase):
             self.sam2_seg_fn = init_sam2()
             print("init sam2 seg fn")
         self.molmo_point_fn = init_molmo()
-        print("init molmo point fn")
+        # No task YAML launches a Molmo server; when nothing listens on its port the tool
+        # is withheld from the generated code's API (see functions()) rather than handed
+        # to the model as an option that can only fail.
+        self.molmo_available = molmo_service_available()
+        print("init molmo point fn" + ("" if self.molmo_available
+                                       else " (service unreachable: point_prompt_molmo disabled)"))
 
         self.ik_solve_fn = init_pyroki()
+        self.ik_check_fn = init_pyroki_ik_check()  # IK + achieved pose, for reachability checks
         self.trajopt_plan_fn = init_pyroki_trajopt()
         self.cfg = None
+        self._last_observation: dict[str, Any] | None = None
+        # Structured account of the last plan_grasp call (grasp source, candidate counts,
+        # fallback geometry, IK checks); recorders may read and clear it.
+        self.last_call_report: dict[str, Any] | None = None
         self.is_spill_wipe = is_spill_wipe
         self.is_peg_assembly = is_peg_assembly
         self.is_handover = is_handover
         self.bimanual = bimanual
         self.real = real
     def functions(self) -> dict[str, Any]:
-        fns = {
-            "get_observation": self.get_observation,
-            "point_prompt_molmo": self.point_prompt_molmo,
-        }
+        fns = {"get_observation": self.get_observation}
+        if self.molmo_available:
+            fns["point_prompt_molmo"] = self.point_prompt_molmo
         if self.use_sam3:
             fns["segment_sam3_text_prompt"] = self.segment_sam3_text_prompt
             fns["segment_sam3_point_prompt"] = self.segment_sam3_point_prompt
@@ -153,6 +184,7 @@ class FrankaControlApiReduced(ApiBase):
         self._log_step("get_observation", "Capturing camera observation …")
         obs = self._env.get_observation()
         obs["robot0_robotview"]["images"]["depth"] = obs["robot0_robotview"]["images"]["depth"].squeeze(-1)
+        self._last_observation = obs
         self._log_step_update(images=obs["robot0_robotview"]["images"]["rgb"])
         return obs
 
@@ -338,6 +370,10 @@ class FrankaControlApiReduced(ApiBase):
             dict[str, tuple[int | None, int | None]]: Pixel coordinates for each
             object query; (None, None) if parsing failed.
         """
+        if not self.molmo_available:
+            raise RuntimeError("point_prompt_molmo is unavailable: no Molmo service is reachable "
+                               "(set CAPX_MOLMO_URL or start one on 127.0.0.1:8122); use "
+                               "segment_sam3_text_prompt instead")
         self._log_step("Molmo Point Prompt", f"Querying Molmo for '{text_prompt}' …", images=image)
         result = self.molmo_point_fn(Image.fromarray(image), objects=[text_prompt])
         if None not in result.values():
@@ -401,12 +437,23 @@ class FrankaControlApiReduced(ApiBase):
         intrinsics: np.ndarray,
         segmentation: np.ndarray,
     ) -> tuple[np.ndarray, np.ndarray]:
-        """Plan grasp candidates using Contact-GraspNet for a single instance.
+        """Plan grasp candidates for a single segmented instance.
 
-        This is a thin wrapper around the Contact-GraspNet planner. It does not
-        apply any camera/world transforms or TCP offsets: the caller is
-        responsible for transforming the resulting grasp poses into the desired
-        frame and applying TCP offsets if necessary.
+        Contact-GraspNet is run on the depth image, cropped to a depth window that always
+        contains the segmented object. If it returns no candidates (typical for very thin or
+        small segments), a geometric fallback derives pinch grasps from the segment's own 3D
+        points: the fingers close across the object's thinnest extent (which must fit the
+        gripper opening), the tool-center point sits on observed geometry, the approach comes
+        from the camera's side perpendicular to the closing axis, candidates that would
+        collide with the scene are dropped, and the rest are checked for IK reachability. If
+        that also yields nothing, ``NoGraspCandidatesError`` is raised with the counts.
+
+        No camera/world transform is applied: transform the poses into the robot base frame
+        yourself (``camera_extrinsics @ grasp_pose``). Each pose is the pose of the
+        gripper's tool-center point (TCP, the grasp point between the fingertips) with ``z``
+        = approach direction and ``y`` = finger closing axis. The poses are TCP poses and
+        are passed to ``solve_ik`` as-is: ``solve_ik`` applies the TCP-to-hand offset
+        internally, so do NOT add or subtract any TCP / hand offset yourself.
 
         Args:
             depth:
@@ -426,7 +473,14 @@ class FrankaControlApiReduced(ApiBase):
                 Homogeneous transforms for each candidate grasp IN THE CAMERA FRAME.
             grasp_scores:
                 np.ndarray of shape (K,), dtype float64.
-                Confidence score for each candidate grasp.
+                Contact-GraspNet confidence per candidate; for geometric-fallback grasps the
+                alignment of the approach with the camera line of sight in (0, 1]. Candidates
+                are ordered best first in both cases.
+
+        Raises:
+            ValueError: empty mask, no valid depth under the mask, or depth/mask shape mismatch.
+            NoGraspCandidatesError: Contact-GraspNet returned no candidates and no
+                collision-free, reachable geometric grasp exists for the segment.
 
         Example:
             >>> cam = obs["robot0_robotview"]
@@ -472,9 +526,26 @@ class FrankaControlApiReduced(ApiBase):
                 f"plan_grasp: none of the {n_mask_px} masked pixels has a valid (finite, > 0) depth value, so "
                 "the segmented object has no 3D geometry."
             )
-        z_range = [0.2, 3.5] if self.is_handover else [0.2, 2.0]
+        obj_lo = float(depth_in_mask[depth_ok].min())
+        obj_hi = float(depth_in_mask[depth_ok].max())
+        # Contact-GraspNet crops the scene to ``z_range`` before planning. Fixed scene cameras
+        # can be well over 2 m from the table, so the window is always widened to contain the
+        # segmented object; otherwise the object itself is cropped away and the planner has
+        # nothing to grasp (two_arm_lift 2026-10-01: handles at 2.2-2.4 m, window 0.2-2.0 m).
+        default_hi = 3.5 if self.is_handover else 2.0
+        z_range = [0.2, round(float(max(default_hi, obj_hi + 0.5)), 3)]
+        report: dict[str, Any] = {
+            "function": "plan_grasp",
+            "mask_pixels": n_mask_px,
+            "object_depth_range_m": [round(obj_lo, 3), round(obj_hi, 3)],
+            "planner_depth_range": z_range,
+            "source": None,
+            "graspnet_candidates": 0,
+            "fallback": None,
+        }
+        self.last_call_report = report
 
-        self._env.grasp_sample, self._env.grasp_scores, _ = self.grasp_net_plan_fn(
+        grasps, scores, _ = self.grasp_net_plan_fn(
             depth,
             intrinsics,
             segmentation,
@@ -482,23 +553,153 @@ class FrankaControlApiReduced(ApiBase):
             z_range=z_range,
             forward_passes=1 if self.is_handover else 3,
         )
-        if len(self._env.grasp_scores) == 0:
-            raise RuntimeError(
-                f"plan_grasp: Contact-GraspNet returned no grasp candidates for the segmented object "
-                f"({n_mask_px} mask pixels, depth {depth_in_mask[depth_ok].min():.3f}-"
-                f"{depth_in_mask[depth_ok].max():.3f} m, planner depth range {z_range}); the segmented "
-                "geometry is too small / thin or outside the planner's depth range. Use a different "
-                "segmentation prompt or compute the grasp pose from the object's 3D points instead."
+        n_graspnet = int(len(scores))
+        report["graspnet_candidates"] = n_graspnet
+        if n_graspnet > 0:
+            self._env.grasp_sample, self._env.grasp_scores = grasps, scores
+            # Contact-GraspNet's grasp frame has the fingers along its x axis (its Panda control
+            # points sit at x = +-0.0527 m), while the IK target frame (URDF ``panda_hand``, the
+            # frame ``solve_ik`` expects) closes the fingers along y. Rotate each grasp by -90 deg
+            # about its approach axis so x_graspnet -> y_hand; without this the executed gripper is
+            # yawed 90 deg against the planned grasp (invisible on cubes, fatal on bars / handles).
+            # The +0.12 m shift along the approach moves the frame to the TCP between the fingertips.
+            self._env.grasp_sample_tf = (
+                vtf.SE3.from_matrix(self._env.grasp_sample)
+                @ vtf.SE3.from_translation(np.array([0, 0, 0.12]))
+                @ vtf.SE3.from_rotation(vtf.SO3.from_z_radians(-np.pi / 2))
+            ).as_matrix()
+            self._env.grasp_source = report["source"] = "contact_graspnet"
+            if hasattr(self._env, "viser_server"):
+                self._env._update_viser_server()
+            self._log_step_update(
+                text=f"Contact-GraspNet: {n_graspnet} candidates, best score={float(scores.max()):.3f}"
             )
-        self._env.grasp_sample_tf = (
-            vtf.SE3.from_matrix(self._env.grasp_sample) @ vtf.SE3.from_translation(np.array([0, 0, 0.12]))
+            return self._env.grasp_sample_tf, self._env.grasp_scores
+
+        # ---- Contact-GraspNet found nothing: geometric fallback on the segment's own points ----
+        graspnet_msg = (
+            f"Contact-GraspNet returned no grasp candidates for the segmented object ({n_mask_px} mask "
+            f"pixels, depth {obj_lo:.3f}-{obj_hi:.3f} m, planner depth range {z_range})"
+        )
+        try:
+            poses_cam, fb_scores, fb_report = geometric_grasp_candidates(
+                object_points_from_mask(depth, intrinsics, in_mask),
+                scene_points_from_depth(depth, intrinsics, stride=2),
+                depth=depth,
+                intrinsics=intrinsics,
+            )
+        except InsufficientGeometryError as exc:
+            report["fallback"] = {"status": "insufficient_geometry", "reason": str(exc)}
+            self._log_step_update(text=f"Contact-GraspNet: 0 candidates; geometric fallback failed: {exc}")
+            raise NoGraspCandidatesError(f"{graspnet_msg}; geometric fallback: {exc}", report) from exc
+        fb_report["status"] = "candidates"
+        report["fallback"] = fb_report
+
+        # Reachability: solve IK for every candidate (each arm of a bimanual API) and keep the
+        # ones the solver actually reaches. The camera is identified by matching the depth
+        # image against the last observation, which also provides camera->base ``pose_mat``.
+        pose_mat = self._camera_pose_for_depth(depth)
+        if pose_mat is None:
+            fb_report["ik"] = {
+                "checked": False,
+                "reason": "depth image does not match any camera of the last get_observation(); "
+                          "reachability not verified",
+            }
+            keep = list(range(len(poses_cam)))
+        else:
+            arms = [0, 1] if self.bimanual else [0]
+            keep = []
+            for i, pose_cam in enumerate(poses_cam):
+                pose_base = pose_mat @ pose_cam
+                checks = [self._ik_reachability(pose_base, arm) for arm in arms]
+                fb_report["candidates"][i]["tcp_base_frame"] = pose_base[:3, 3].round(4).tolist()
+                fb_report["candidates"][i]["ik"] = checks
+                if any(c["reachable"] is not False for c in checks):
+                    keep.append(i)
+            fb_report["ik"] = {
+                "checked": True,
+                "arms": arms,
+                "reachable_candidates": len(keep),
+                "tolerance": {"position_m": self._IK_POS_TOL, "orientation_deg": self._IK_ROT_TOL_DEG},
+            }
+            if not keep:
+                worst = "; ".join(
+                    f"cand {i}: " + ", ".join(
+                        f"arm{c['arm']} pos_err={c.get('position_error_m')} m rot_err={c.get('orientation_error_deg')} deg"
+                        for c in cand["ik"])
+                    for i, cand in enumerate(fb_report["candidates"])
+                )
+                raise NoGraspCandidatesError(
+                    f"{graspnet_msg}; the geometric fallback produced {len(poses_cam)} pinch candidate(s) but none "
+                    f"is reachable (IK position error > {self._IK_POS_TOL} m or orientation error > "
+                    f"{self._IK_ROT_TOL_DEG} deg for every arm): {worst}",
+                    report,
+                )
+        poses_cam = poses_cam[keep]
+        fb_scores = fb_scores[keep]
+        fb_report["candidates"] = [fb_report["candidates"][i] for i in keep]
+        fb_report["returned"] = len(keep)
+        self._env.grasp_source = report["source"] = "geometric_fallback"
+        self._env.grasp_sample_tf, self._env.grasp_scores = poses_cam, fb_scores
+        self._env.grasp_sample = (
+            vtf.SE3.from_matrix(poses_cam) @ vtf.SE3.from_translation(np.array([0, 0, -0.12]))
         ).as_matrix()
         if hasattr(self._env, "viser_server"):
             self._env._update_viser_server()
-        n_candidates = len(self._env.grasp_scores)
-        best_score = float(self._env.grasp_scores.max()) if n_candidates > 0 else 0.0
-        self._log_step_update(text=f"{n_candidates} candidates, best score={best_score:.3f}")
-        return self._env.grasp_sample_tf, self._env.grasp_scores
+        ik_note = (f"{len(keep)} reachable" if fb_report["ik"]["checked"] else "IK not checked")
+        self._log_step_update(
+            text=(f"Contact-GraspNet: 0 candidates; geometric fallback: {len(poses_cam)} pinch grasp(s) across "
+                  f"{fb_report['obb']['closing_extent_m']:.3f} m ({ik_note})")
+        )
+        return poses_cam, fb_scores
+
+    _IK_POS_TOL = 0.02  # m: least-squares IK that lands farther than this did not reach the target
+    _IK_ROT_TOL_DEG = 15.0
+
+    def _camera_pose_for_depth(self, depth: np.ndarray) -> np.ndarray | None:
+        """Camera->robot-base ``pose_mat`` of the last observation's camera whose depth image is
+        ``depth`` (the agent plans from the arrays ``get_observation`` returned), else None."""
+        obs = self._last_observation
+        if not isinstance(obs, dict):
+            return None
+        depth = np.asarray(depth)
+        for cam in obs.values():
+            if not isinstance(cam, dict) or "pose_mat" not in cam or not isinstance(cam.get("images"), dict):
+                continue
+            cam_depth = cam["images"].get("depth")
+            if cam_depth is None:
+                continue
+            cam_depth = np.squeeze(np.asarray(cam_depth))
+            if cam_depth.shape == depth.shape and np.array_equal(cam_depth, depth):
+                return np.asarray(cam["pose_mat"], dtype=np.float64)
+        return None
+
+    def _ik_reachability(self, pose_base: np.ndarray, arm: int) -> dict[str, Any]:
+        """Solve IK for a TCP pose in robot0's base frame with ``arm`` (0 or 1) and compare the
+        pose the solver reached with the request. ``reachable`` is None when it could not be
+        judged (no achieved pose from the server, or the request failed)."""
+        pos = np.asarray(pose_base[:3, 3], dtype=np.float64)
+        quat = np.asarray(vtf.SO3.from_matrix(pose_base[:3, :3]).wxyz, dtype=np.float64)
+        out: dict[str, Any] = {"arm": arm, "reachable": None}
+        try:
+            if arm == 1:
+                pos, quat = transform_pose_arm0_to_arm1(pos, quat, self._env)
+            offset_pos = apply_tcp_offset(pos, quat, self._TCP_OFFSET)
+            joints, achieved = self.ik_check_fn(np.concatenate([quat, offset_pos]))
+        except Exception as exc:  # noqa: BLE001 - report, do not hide
+            out["error"] = f"{type(exc).__name__}: {exc}"
+            return out
+        out["joints"] = np.asarray(joints, dtype=np.float64)[:7].round(4).tolist()
+        if achieved is None:
+            out["note"] = "IK server did not return the achieved pose; reachability unknown"
+            return out
+        achieved = np.asarray(achieved, dtype=np.float64)
+        pos_err = float(np.linalg.norm(achieved[4:7] - offset_pos))
+        rot_err = float(np.linalg.norm((vtf.SO3(wxyz=achieved[:4]).inverse() @ vtf.SO3(wxyz=quat)).log()))
+        out["position_error_m"] = round(pos_err, 4)
+        out["orientation_error_deg"] = round(float(np.degrees(rot_err)), 2)
+        out["reachable"] = bool(pos_err <= self._IK_POS_TOL and np.degrees(rot_err) <= self._IK_ROT_TOL_DEG)
+        return out
 
     # --------------------------------------------------------------------- #
     # IK / motion primitives

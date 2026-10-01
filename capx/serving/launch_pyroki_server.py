@@ -176,10 +176,15 @@ class IkRequest(BaseModel):
 
     target_pose_wxyz_xyz: list[float]  # length 7 (wxyz + xyz)
     prev_cfg: list[float] | None = None  # optional
+    # When true, the response also carries the target link's pose at the returned
+    # configuration (forward kinematics), so callers can measure how far the least-squares
+    # solution landed from the requested pose, i.e. whether the target is reachable.
+    return_pose: bool = False
 
 
 class IkResponse(BaseModel):
     joint_positions: list[float]
+    achieved_pose_wxyz_xyz: list[float] | None = None  # only when return_pose was requested
 
 
 class ObstacleEntry(BaseModel):
@@ -314,6 +319,13 @@ def _do_solve_ik(target_pose_wxyz_xyz: np.ndarray, prev_cfg: np.ndarray | None) 
     return list(map(float, q))
 
 
+def _do_forward_kinematics(joints: list[float]) -> list[float]:
+    """Pose (wxyz_xyz) of the IK target link at ``joints`` (blocking, CPU-bound)."""
+    link_index = _ROBOT.links.names.index(_TARGET_LINK)
+    poses = np.asarray(_ROBOT.forward_kinematics(np.asarray(joints, dtype=np.float64)))
+    return list(map(float, poses[link_index]))
+
+
 @app.post("/ik", response_model=IkResponse)
 async def solve_ik(req: IkRequest):
     if _ROBOT is None:
@@ -324,11 +336,12 @@ async def solve_ik(req: IkRequest):
 
     try:
         joints = await _run_in_thread(_do_solve_ik, target_pose_wxyz_xyz, prev_cfg)
+        achieved = await _run_in_thread(_do_forward_kinematics, joints) if req.return_pose else None
     except Exception as e:
         logger.exception("IK failed")
         raise HTTPException(500, f"IK solve failed: {e}")
 
-    return IkResponse(joint_positions=joints)
+    return IkResponse(joint_positions=joints, achieved_pose_wxyz_xyz=achieved)
 
 
 def _do_plan_motion(req: PlanRequest) -> PlanResponse:

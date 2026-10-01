@@ -460,7 +460,17 @@ class RobosuiteTwoArmLiftEnv(BaseEnv):
 
     def get_observation(self) -> dict[str, Any]:
         """Get observation in FrankaPickPlaceLowLevel format."""
-        robosuite_obs = self.robosuite_env._get_observations()
+        # The agentview camera is moved by writing sim.model.cam_pos/cam_quat; MuJoCo only
+        # propagates that to the rendered camera (sim.data.cam_xpos/xmat) on the next forward
+        # pass. Without it the first observation after reset -- the one the agent plans from --
+        # is rendered from robosuite's default camera while every later one uses the moved
+        # camera (seen in the 2026-10-01 two_arm_lift runs as depth 0.4-2.7 m vs 1.6-4.2 m).
+        # Same handling as RobosuiteHandoverEnv.get_observation.
+        agentview_cam_id = self.robosuite_env.sim.model.camera_name2id("agentview")
+        self.robosuite_env.sim.model.cam_pos[agentview_cam_id] = [1.5, 0.0, 2.5]
+        self.robosuite_env.sim.model.cam_quat[agentview_cam_id] = [0.653, 0.271, 0.271, 0.653]
+        self.robosuite_env.sim.forward()
+        robosuite_obs = self.robosuite_env._get_observations(force_update=True)
         pose_dict = self._pot_pose_dict(robosuite_obs)
 
         # Store pot poses explicitly
