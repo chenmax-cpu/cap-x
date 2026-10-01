@@ -138,6 +138,17 @@ class FrankaControlApiReduced(ApiBase):
                 - ["robot0_robotview"]["images"]["depth"]: Current depth camera image as a numpy array of shape (H, W), dtype float32.
                 - ["robot0_robotview"]["intrinsics"]: Camera intrinsic matrix as a numpy array of shape (3, 3), dtype float64.
                 - ["robot0_robotview"]["pose_mat"]: Camera extrinsic matrix as a numpy array of shape (4, 4), dtype float64.
+                  It is the camera-to-robot-base transform: ``pose_mat @ [x, y, z, 1]`` maps a
+                  camera-frame point into the robot base frame the pose functions use.
+
+                Depth contract (same for every camera key in the observation): ``depth`` is the
+                metric distance in meters along the camera's optical axis, one value per pixel.
+                Every pixel is valid -- there are no 0 / NaN / inf "holes" to filter out and the far
+                plane lies well beyond the workspace. The cameras are fixed scene cameras that can
+                be several meters from the table, so do NOT discard pixels with a hard-coded depth
+                range (e.g. ``depth < 2.0``): such a cut-off can remove the whole object and leave
+                an empty point cloud. Select geometry with the segmentation mask, and express any
+                spatial bounds in the robot base frame after applying ``pose_mat``.
         """
         self._log_step("get_observation", "Capturing camera observation …")
         obs = self._env.get_observation()
@@ -354,8 +365,32 @@ class FrankaControlApiReduced(ApiBase):
         Example:
             >>> points = np.random.randn((100, 3))
             >>> obb = get_oriented_bounding_box_from_3d_points(points)
+
+        Raises:
+            ValueError: if ``points`` is not (N, 3) or holds fewer than 4 points.
+            RuntimeError: if no box can be fitted (too few distinct points after the
+                helper's statistical outlier removal).
         """
-        return _get_obb(points)
+        points = np.asarray(points, dtype=np.float64)
+        if points.ndim != 2 or points.shape[1] != 3:
+            raise ValueError(
+                f"get_oriented_bounding_box_from_3d_points: expected points of shape (N, 3), got {points.shape}"
+            )
+        if len(points) < 4:
+            raise ValueError(
+                f"get_oriented_bounding_box_from_3d_points: received {len(points)} point(s); an oriented "
+                "bounding box needs at least 4 non-coplanar points. If the points came from a masked depth "
+                "image, check the segmentation mask and any depth / workspace filters applied upstream "
+                "(see the depth contract in get_observation)."
+            )
+        try:
+            return _get_obb(points)
+        except RuntimeError as exc:  # qhull errors from Open3D on degenerate or too few points
+            raise RuntimeError(
+                f"get_oriented_bounding_box_from_3d_points: could not fit an oriented bounding box to "
+                f"{len(points)} points (too few distinct points after the helper's statistical outlier "
+                f"removal); check the segmentation mask and upstream depth / workspace filters: {exc}"
+            ) from exc
 
     # --------------------------------------------------------------------- #
     # Grasp planner (Contact-GraspNet)
@@ -417,14 +452,44 @@ class FrankaControlApiReduced(ApiBase):
         if segmentation.ndim == 3 and segmentation.shape[-1] == 1:
             segmentation = segmentation[:, :, 0]
 
+        # Fail with a description of the geometry instead of an opaque error deeper down
+        # when perception did not deliver enough of the object to plan on.
+        if depth.shape != segmentation.shape:
+            raise ValueError(
+                f"plan_grasp: depth {depth.shape} and segmentation {segmentation.shape} must have the same (H, W)"
+            )
+        in_mask = np.asarray(segmentation) > 0
+        n_mask_px = int(np.count_nonzero(in_mask))
+        if n_mask_px == 0:
+            raise ValueError(
+                "plan_grasp: the segmentation mask selects 0 pixels, so there is no object geometry to plan a "
+                "grasp on; check the segmentation result (and its score) before calling plan_grasp."
+            )
+        depth_in_mask = np.asarray(depth, dtype=np.float64)[in_mask]
+        depth_ok = np.isfinite(depth_in_mask) & (depth_in_mask > 0)
+        if not depth_ok.any():
+            raise ValueError(
+                f"plan_grasp: none of the {n_mask_px} masked pixels has a valid (finite, > 0) depth value, so "
+                "the segmented object has no 3D geometry."
+            )
+        z_range = [0.2, 3.5] if self.is_handover else [0.2, 2.0]
+
         self._env.grasp_sample, self._env.grasp_scores, _ = self.grasp_net_plan_fn(
             depth,
             intrinsics,
             segmentation,
             1,
-            z_range=[0.2, 3.5] if self.is_handover else [0.2, 2.0],
+            z_range=z_range,
             forward_passes=1 if self.is_handover else 3,
         )
+        if len(self._env.grasp_scores) == 0:
+            raise RuntimeError(
+                f"plan_grasp: Contact-GraspNet returned no grasp candidates for the segmented object "
+                f"({n_mask_px} mask pixels, depth {depth_in_mask[depth_ok].min():.3f}-"
+                f"{depth_in_mask[depth_ok].max():.3f} m, planner depth range {z_range}); the segmented "
+                "geometry is too small / thin or outside the planner's depth range. Use a different "
+                "segmentation prompt or compute the grasp pose from the object's 3D points instead."
+            )
         self._env.grasp_sample_tf = (
             vtf.SE3.from_matrix(self._env.grasp_sample) @ vtf.SE3.from_translation(np.array([0, 0, 0.12]))
         ).as_matrix()
