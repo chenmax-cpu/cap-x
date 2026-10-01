@@ -508,11 +508,18 @@ class FrankaControlApiReduced(ApiBase):
         position: np.ndarray,
         quaternion_wxyz: np.ndarray,
     ) -> np.ndarray:
-        """Solve inverse kinematics for the panda_hand link.
+        """Solve inverse kinematics so that the gripper's tool-center point (TCP,
+        the grasp point between the fingertips) reaches the target pose.
+
+        The fixed TCP-to-panda_hand offset is applied internally before solving.
+        Pass the desired grasp / TCP pose directly (e.g. a ``plan_grasp`` pose
+        transformed into the world frame); do NOT subtract any TCP or hand
+        offset yourself -- that would place the gripper about 10 cm short of
+        the target.
 
         Args:
             position:
-                Target position in world frame.
+                Target TCP position in world frame.
                 Shape: (3,), dtype float64.
             quaternion_wxyz:
                 Target orientation as a unit quaternion in world frame.
@@ -706,7 +713,8 @@ class FrankaControlApiReduced(ApiBase):
         _close_gripper_arm1(self._env, steps=30)
 
     def solve_ik_arm0(self, position: np.ndarray, quaternion_wxyz: np.ndarray) -> np.ndarray:
-        """Solve inverse kinematics for the panda_hand link for Arm 0 (robot0)."""
+        """Solve inverse kinematics for the gripper TCP of Arm 0 (robot0); the TCP-to-hand
+        offset is applied internally (see ``solve_ik``)."""
         pos = np.asarray(position, dtype=np.float64).reshape(3)
         quat_wxyz = np.asarray(quaternion_wxyz, dtype=np.float64).reshape(4)
         offset_pos = apply_tcp_offset(pos, quat_wxyz, self._TCP_OFFSET)
@@ -717,7 +725,8 @@ class FrankaControlApiReduced(ApiBase):
         return extract_arm_joints(self.cfg)
 
     def solve_ik_arm1(self, position: np.ndarray, quaternion_wxyz: np.ndarray) -> np.ndarray:
-        """Solve inverse kinematics for the panda_hand link for Arm 1 (robot1)."""
+        """Solve inverse kinematics for the gripper TCP of Arm 1 (robot1); the TCP-to-hand
+        offset is applied internally (see ``solve_ik``)."""
         if not hasattr(self._env, "move_to_joints_blocking_arm1"):
             raise RuntimeError("Environment does not support Arm 1 control")
 
