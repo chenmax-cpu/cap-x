@@ -388,6 +388,13 @@ class FrankaControlApiReduced(ApiBase):
     def get_oriented_bounding_box_from_3d_points(self, points: np.ndarray) -> dict[str, Any]:
         """Get the oriented bounding box from 3D points.
 
+        Use the box to locate and size an object and to derive placement targets (e.g. a
+        point above another object's top face). It is not a grasp planner: the center of
+        a thin or hollow part lies in empty space and ``R`` does not say where fingers
+        fit, so do not pass ``center``/``R`` to ``solve_ik`` as a grasp pose -- grasps
+        come from ``plan_grasp`` (see its grasp contract), which itself falls back to
+        validated geometry when Contact-GraspNet has no candidate.
+
         Args:
             points: np.ndarray: The 3D points to get the oriented bounding box from.
                 Shape: (N, 3), dtype float64.
@@ -454,6 +461,21 @@ class FrankaControlApiReduced(ApiBase):
         = approach direction and ``y`` = finger closing axis. The poses are TCP poses and
         are passed to ``solve_ik`` as-is: ``solve_ik`` applies the TCP-to-hand offset
         internally, so do NOT add or subtract any TCP / hand offset yourself.
+
+        Grasp contract: this function is the grasp planner of the API, so the pose a
+        gripper closes at comes from one of its candidates. When the task prefers a grasp
+        direction (sideways, from above, from a given side), select or filter among the
+        candidates by their axes after transforming them to the base frame -- e.g. keep
+        the candidates whose closing axis ``y`` is most vertical for a sideways grasp --
+        instead of building a grasp pose from a bounding-box center or a point-cloud
+        centroid: the center of a thin or hollow part (a handle, a rim) lies in empty
+        space and a box orientation says nothing about where the fingers fit. If this
+        function raises ``NoGraspCandidatesError`` (a ``RuntimeError`` whose message
+        starts with ``no_grasp_candidates:``; the class is not bound in the program
+        namespace), no validated grasp exists for that segment: segment the object again
+        (another prompt or instance) and call ``plan_grasp`` on the new mask, or let the
+        error propagate so the failure is explicit. Do not catch it and continue with a
+        guessed grasp.
 
         Args:
             depth:
